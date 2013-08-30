@@ -22,9 +22,13 @@ DOCUMENTATION = '''
 inventory: rax
 short_description: Rackspace Public Cloud external inventory script
 description:
-  - Generates inventory that Ansible can understand by making API request to Rackspace Public Cloud API
+  >
+  Generates inventory that Ansible can understand by making API request to
+  Rackspace Public Cloud API
   - |
-    When run against a specific host, this script returns the following variables:
+    >
+    When run against a specific host, this script returns the following
+    variables:
         rax_os-ext-sts_task_state
         rax_addresses
         rax_links
@@ -64,7 +68,9 @@ options:
     default: DFW
 author: Jesse Keating
 notes:
-  - Two environment variables need to be set, RAX_CREDS and RAX_REGION.
+  - Two environment variables can be set, RAX_CREDS and RAX_REGION.
+  - If the RAX_CREDS is not set the default ANSIBLE_CONFIG will be used.
+  - Look at rax.ini for an example of the available config file.
   - RAX_CREDS points to a credentials file appropriate for pyrax
   - RAX_REGION defines a Rackspace Public Cloud region (DFW, ORD, LON, ...)
 requirements: [ "pyrax" ]
@@ -75,45 +81,73 @@ examples:
       code: RAX_CREDS=~/.raxpub RAX_REGION=ORD rax.py --host <HOST_IP>
 '''
 
-import sys
-import re
-import os
 import argparse
-
+import ConfigParser
 try:
     import json
 except:
     import simplejson as json
+import os
+import sys
 
 try:
     import pyrax
 except ImportError:
-    print('pyrax required for this module')
+    print('[pyrax] is required for this module')
     sys.exit(1)
 
 # Setup the parser
-parser = argparse.ArgumentParser(description='List active instances',
-                            epilog='List by itself will list all the active \
-                            instances. Listing a specific instance will show \
-                            all the details about the instance.')
+parser = argparse.ArgumentParser(
+    description='List active instances',
+    epilog=('List by itself will list all the active instances. Listing a'
+            ' specific instance will show all the details about the instance.')
+)
 
-parser.add_argument('--list', action='store_true', default=True,
-                            help='List active servers')
+parser.add_argument('--list',
+                    action='store_true',
+                    default=True,
+                    help='List active servers')
 parser.add_argument('--host',
                     help='List details about the specific host (IP address)')
-
 args = parser.parse_args()
+
+
+def nova_load_config_file():
+    p = ConfigParser.SafeConfigParser()
+    path1 = os.environ.get('RAX_CREDS_FILE',
+                           os.environ.get('ANSIBLE_CONFIG', "~/rax.ini"))
+    path2 = os.getcwd() + "/rax.ini"
+    path3 = "/etc/ansible/rax.ini"
+
+    for path in path1, path2, path3:
+        if os.path.exists(path):
+            p.read(path)
+            break
+    else:
+        return None
+    return p, path
+
 
 # setup the auth
 try:
-    creds_file = os.environ['RAX_CREDS_FILE']
-    region = os.environ['RAX_REGION']
+    creds, path = nova_load_config_file()
+    if creds.get('rackspace_cloud', 'region') is not None:
+        region = creds.get('rackspace_cloud', 'region')
+    elif os.environ.get('RAX_REGION'):
+        region = os.environ.get('RAX_REGION')
+    else:
+        sys.exit('No Region was found in your config File "%s" or in an ENV'
+                 ' "RAX_REGION".' % path)
 except KeyError, e:
     sys.stderr.write('Unable to load %s\n' % e.message)
     sys.exit(1)
+else:
+    region = region.upper()
 
 try:
-    pyrax.set_credential_file(os.path.expanduser(creds_file),
+    # setting the rax identity per pyrax issue 79
+    pyrax.settings.set('identity_type', 'rackspace')
+    pyrax.set_credential_file(os.path.expanduser(path),
                               region=region)
 except Exception, e:
     sys.stderr.write("%s: %s\n" % (e, e.message))
@@ -132,10 +166,11 @@ if not args.host:
             group = 'undefined'
 
         # Create group if not exist and add the server
-        groups.setdefault(group, []).append(server.accessIPv4)
+        _server = (server.name, server.accessIPv4)
+        groups.setdefault(group, []).append('%s: %s' % _server)
 
     # Return server list
-    print(json.dumps(groups))
+    print(json.dumps(groups, indent=2))
     sys.exit(0)
 
 # Get the deets for the instance asked for
@@ -149,8 +184,7 @@ for server in pyrax.cloudservers.list():
             value = getattr(server, key)
     
             # Generate sanitized key
-            key = 'rax_' + re.sub("[^A-Za-z0-9\-]", "_", key).lower()
-            results[key] = value
+            results['rax_%s' % key] = value
 
-print(json.dumps(results))
+print(json.dumps(results, indent=2))
 sys.exit(0)
