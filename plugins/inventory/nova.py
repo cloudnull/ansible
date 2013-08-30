@@ -22,9 +22,13 @@ DOCUMENTATION = '''
 inventory: nova
 short_description: OpenStack external inventory script
 description:
-  - Generates inventory that Ansible can understand by making API request to OpenStack endpoint using the novaclient library.
+  >
+  Generates inventory that Ansible can understand by making API request to
+  OpenStack endpoint using the novaclient library.
   - |
-    When run against a specific host, this script returns the following variables:
+    >
+    When run against a specific host, this script returns the following
+    variables:
         os_os-ext-sts_task_state
         os_addresses
         os_links
@@ -66,19 +70,24 @@ options:
     default: null
   api_key:
     description:
-      - Password used to authenticate in OpenStack, can be the ApiKey on some authentication system.
+      >
+      Password used to authenticate in OpenStack, can be the ApiKey on some
+      authentication system.
     required: true
     default: null
   auth_url:
     description:
       - Authentication URL required to generate token.
-      - To manage RackSpace use I(https://identity.api.rackspacecloud.com/v2.0/)
+      >
+      To manage RackSpace use I(https://identity.api.rackspacecloud.com/v2.0/)
     required: true
     default: null
   auth_system:
     description:
       - Authentication system used to login
-      - To manage RackSpace install B(rackspace-novaclient) and insert I(rackspace)
+      >
+      To manage RackSpace install B(rackspace-novaclient) and insert
+      I(rackspace)
     required: true
     default: null
   region_name:
@@ -119,7 +128,9 @@ options:
     choices: [ "true", "false" ]
 author: Marco Vito Moscaritolo
 notes:
-  - This script assumes Ansible is being executed where the environment variables needed for novaclient have already been set on nova.ini file
+  >
+  This script assumes Ansible is being executed where the environment variables
+  needed for novaclient have already been set on nova.ini file
   - For more details, see U(https://github.com/openstack/python-novaclient)
 examples:
     - description: List instances
@@ -128,109 +139,124 @@ examples:
       code: nova.py --instance INSTANCE_IP
 '''
 
-
-import sys
-import re
-import os
 import ConfigParser
-from novaclient import client as nova_client
-
 try:
     import json
-except:
+except Exception:
     import simplejson as json
+import os
+import sys
 
-###################################################
-# executed with no parameters, return the list of
-# all groups and hosts
+from novaclient import client as nova_client
+
+
+def get_addresses(addr):
+    # Find Private addresses
+    private = [x['addr'] for x in addr
+               if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'fixed']
+
+    # Find Public addresses
+    public = [x['addr'] for x in addr
+              if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'floating']
+
+    # Find DHCP(legacy) addresses
+    legacy = [x['addr'] for x in addr
+              if 'version' in x and x['version'] == 4]
+
+    return private, public, legacy
+
 
 def nova_load_config_file():
     p = ConfigParser.SafeConfigParser()
-    path1 = os.getcwd() + "/nova.ini"
-    path2 = os.path.expanduser(os.environ.get('ANSIBLE_CONFIG', "~/nova.ini"))
+    path1 = os.path.expanduser(os.environ.get('ANSIBLE_CONFIG', "~/nova.ini"))
+    path2 = os.getcwd() + "/nova.ini"
     path3 = "/etc/ansible/nova.ini"
 
-    if os.path.exists(path1):
-        p.read(path1)
-    elif os.path.exists(path2):
-        p.read(path2)
-    elif os.path.exists(path3):
-        p.read(path3)
+    for path in path1, path2, path3:
+        if os.path.exists(path):
+            p.read(path)
+            break
     else:
         return None
     return p
 
-config = nova_load_config_file()
 
+config = nova_load_config_file()
 client = nova_client.Client(
-    version     = config.get('openstack', 'version'),
-    username    = config.get('openstack', 'username'),
-    api_key     = config.get('openstack', 'api_key'),
-    auth_url    = config.get('openstack', 'auth_url'),
-    region_name = config.get('openstack', 'region_name'),
-    project_id  = config.get('openstack', 'project_id'),
-    auth_system = config.get('openstack', 'auth_system')
+    version=config.get('openstack', 'version'),
+    username=config.get('openstack', 'username'),
+    api_key=config.get('openstack', 'api_key'),
+    auth_url=config.get('openstack', 'auth_url'),
+    region_name=config.get('openstack', 'region_name'),
+    project_id=config.get('openstack', 'project_id'),
+    auth_system=config.get('openstack', 'auth_system')
 )
 
+
+###################################################
+# executed with no parameters, return the list of
+# all groups and hosts
 if len(sys.argv) == 2 and (sys.argv[1] == '--list'):
     groups = {}
 
     # Cycle on servers
-    for f in client.servers.list():
-	private = [ x['addr'] for x in getattr(f, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'fixed']
-	public  = [ x['addr'] for x in getattr(f, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'floating']
-	    
-	# Define group (or set to empty string)
-        group = f.metadata['group'] if f.metadata.has_key('group') else 'undefined'
+    for instance in client.servers.list():
+        private, public, legacy = get_addresses(
+            addr=getattr(instance, 'addresses').itervalues().next()
+        )
+        # Define group (or set to empty string)
+        group = instance.metadata.get('group', 'undefined')
 
         # Create group if not exist
         if group not in groups:
             groups[group] = []
 
         # Append group to list
-	if f.accessIPv4:
-        	groups[group].append(f.accessIPv4)
-		continue
-	if public:
-        	groups[group].append(''.join(public))
-		continue
-	if private:
-        	groups[group].append(''.join(private))
-		continue
+        ips = [instance.accessIPv4,
+               ', '.join(private),
+               ', '.join(public),
+               ', '.join(legacy)]
+        for addr in ips:
+            if addr:
+                _instance = '%s: %s' % (instance.name, addr)
+                groups[group].append(_instance)
+            continue
+        del ips
 
     # Return server list
-    print json.dumps(groups)
+    print(json.dumps(groups, indent=2))
     sys.exit(0)
 
 #####################################################
 # executed with a hostname as a parameter, return the
 # variables for that host
-
 elif len(sys.argv) == 3 and (sys.argv[1] == '--host'):
     results = {}
-    ips = []
     for instance in client.servers.list():
-	private = [ x['addr'] for x in getattr(instance, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'fixed']
-	public =  [ x['addr'] for x in getattr(instance, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'floating']
-        ips.append( instance.accessIPv4)
-	ips.append(''.join(private))
-	ips.append(''.join(public))
-	if sys.argv[2] in ips:
-            for key in vars(instance):
+        private, public, legacy = get_addresses(
+            addr=getattr(instance, 'addresses').itervalues().next()
+        )
+        ips = [instance.accessIPv4,
+               ', '.join(private),
+               ', '.join(public),
+               ', '.join(legacy)]
+        if sys.argv[2] in ips:
+            for key in [key for key in vars(instance) if key not in 'manager']:
                 # Extract value
                 value = getattr(instance, key)
 
                 # Generate sanitized key
-                key = 'os_' + re.sub("[^A-Za-z0-9\-]", "_", key).lower()
+                key = 'os_%s' % key.lower()
+
+                #TODO(UNKNOWN): maybe use value.__class__ or similar inside
+                #TODO(UNKNOWN): of key_name
 
                 # Att value to instance result (exclude manager class)
-                #TODO: maybe use value.__class__ or similar inside of key_name
-                if key != 'os_manager':
-                    results[key] = value
+                results[key] = value
+        del ips
 
-    print json.dumps(results)
+    print(json.dumps(results, indent=2))
     sys.exit(0)
-
 else:
-    print "usage: --list  ..OR.. --host <hostname>"
+    print("usage: --list  ..OR.. --host <hostname>")
     sys.exit(1)
