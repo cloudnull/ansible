@@ -177,7 +177,8 @@ def nova_load_config_file():
             p.read(path)
             break
     else:
-        return None
+        sys.exit('No Configuration File could be found in [%s, %s, %s]'
+                 % (path3, path2, path1))
     return p
 
 
@@ -214,8 +215,10 @@ if len(sys.argv) == 2 and (sys.argv[1] == '--list'):
         # Append group to list
         ips = [instance.accessIPv4,
                ', '.join(private),
-               ', '.join(public),
-               ', '.join(legacy)]
+               ', '.join(public)]
+        if not instance.accessIPv4:
+            ips.append(', '.join(legacy))
+
         for addr in ips:
             if addr:
                 _instance = '%s: %s' % (instance.name, addr)
@@ -238,8 +241,10 @@ elif len(sys.argv) == 3 and (sys.argv[1] == '--host'):
         )
         ips = [instance.accessIPv4,
                ', '.join(private),
-               ', '.join(public),
-               ', '.join(legacy)]
+               ', '.join(public)]
+        if not instance.accessIPv4:
+            ips.append(', '.join(legacy))
+
         if sys.argv[2] in ips:
             for key in [key for key in vars(instance) if key not in 'manager']:
                 # Extract value
