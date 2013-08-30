@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # (c) 2013, Jesse Keating <jesse.keating@rackspace.com>
+# (c) 2013, Kevin Carter <kevin.carter@rackspace.com>
 #
 # This file is part of Ansible,
 #
@@ -71,51 +72,47 @@ notes:
   - Two environment variables can be set, RAX_CREDS and RAX_REGION.
   - If the RAX_CREDS is not set the default ANSIBLE_CONFIG will be used.
   - Look at rax.ini for an example of the available config file.
-  - RAX_CREDS points to a credentials file appropriate for pyrax
+  - RAX_CREDS points to a credentials file.
   - RAX_REGION defines a Rackspace Public Cloud region (DFW, ORD, LON, ...)
-requirements: [ "pyrax" ]
+requirements: [ "novaclient" ]
 examples:
     - description: List server instances
       code: RAX_CREDS=~/.raxpub RAX_REGION=ORD rax.py --list
     - description: List server instance properties
       code: RAX_CREDS=~/.raxpub RAX_REGION=ORD rax.py --host <HOST_IP>
 '''
-
-import argparse
 import ConfigParser
 try:
     import json
-except:
+except ImportError:
     import simplejson as json
 import os
 import sys
 
-try:
-    import pyrax
-except ImportError:
-    print('[pyrax] is required for this module')
-    sys.exit(1)
+from novaclient import client as nova_client
 
-# Setup the parser
-parser = argparse.ArgumentParser(
-    description='List active instances',
-    epilog=('List by itself will list all the active instances. Listing a'
-            ' specific instance will show all the details about the instance.')
-)
 
-parser.add_argument('--list',
-                    action='store_true',
-                    default=True,
-                    help='List active servers')
-parser.add_argument('--host',
-                    help='List details about the specific host (IP address)')
-args = parser.parse_args()
+def get_addresses(addr):
+    # Find Private addresses
+    private = [x['addr'] for x in addr
+               if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'fixed']
+
+    # Find Public addresses
+    public = [x['addr'] for x in addr
+              if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'floating']
+
+    # Find DHCP(legacy) addresses
+    legacy = [x['addr'] for x in addr
+              if 'version' in x and x['version'] == 4]
+
+    return private, public, legacy
 
 
 def nova_load_config_file():
-    p = ConfigParser.SafeConfigParser()
-    path1 = os.environ.get('RAX_CREDS_FILE',
-                           os.environ.get('ANSIBLE_CONFIG', "~/rax.ini"))
+    p = ConfigParser.ConfigParser()
+    path1 = os.environ.get(
+        'RAX_CREDS_FILE', os.environ.get('ANSIBLE_CONFIG', "~/rax.ini")
+    )
     path2 = os.getcwd() + "/rax.ini"
     path3 = "/etc/ansible/rax.ini"
 
@@ -124,67 +121,128 @@ def nova_load_config_file():
             p.read(path)
             break
     else:
-        return None
-    return p, path
+        sys.exit('No Configuration File could be found in [%s, %s, %s]'
+                 % (path3, path2, path1))
+    return p
 
 
-# setup the auth
-try:
-    creds, path = nova_load_config_file()
-    if creds.get('rackspace_cloud', 'region') is not None:
-        region = creds.get('rackspace_cloud', 'region')
-    elif os.environ.get('RAX_REGION'):
-        region = os.environ.get('RAX_REGION')
-    else:
-        sys.exit('No Region was found in your config File "%s" or in an ENV'
-                 ' "RAX_REGION".' % path)
-except KeyError, e:
-    sys.stderr.write('Unable to load %s\n' % e.message)
-    sys.exit(1)
-else:
-    region = region.upper()
+class auth_plugin(object):
+    def __init__(self):
+        """Craetes an authentication plugin for use with Rackspace."""
 
-try:
-    # setting the rax identity per pyrax issue 79
-    pyrax.settings.set('identity_type', 'rackspace')
-    pyrax.set_credential_file(os.path.expanduser(path),
-                              region=region)
-except Exception, e:
-    sys.stderr.write("%s: %s\n" % (e, e.message))
-    sys.exit(1)
+        self.auth_url = self.global_auth()
 
-# Execute the right stuff
-if not args.host:
+    def global_auth(self):
+        """Return the Rackspace Cloud US Auth URL."""
+
+        return "https://identity.api.rackspacecloud.com/v2.0/"
+
+    def _authenticate(self, cls, auth_url):
+        """Authenticate against the Rackspace auth service."""
+
+        body = {"auth": {
+            "RAX-KSKEY:apiKeyCredentials": {
+                "username": cls.user,
+                "apiKey": cls.password,
+                "tenantName": cls.projectid}}}
+        return cls._authenticate(auth_url, body)
+
+    def authenticate(self, cls, auth_url):
+        """Authenticate against the Rackspace US auth service."""
+
+        return self._authenticate(cls, auth_url)
+
+
+# Parse Configuration File
+config = nova_load_config_file()
+username = config.get('rackspace_cloud', 'username')
+password = config.get('rackspace_cloud', 'api_key')
+
+# Load our Authentication Plugin
+plugin = auth_plugin()
+
+client = nova_client.Client(
+    version=2,
+    username=username,
+    api_key=password,
+    auth_url=plugin.auth_url,
+    region_name=config.get('rackspace_cloud', 'region'),
+    project_id=username,
+    auth_system='rackspace',
+    auth_plugin=plugin
+)
+
+
+###################################################
+# executed with no parameters, return the list of
+# all groups and hosts
+if len(sys.argv) == 2 and (sys.argv[1] == '--list'):
     groups = {}
 
     # Cycle on servers
-    for server in pyrax.cloudservers.list():
+    for instance in client.servers.list():
+        private, public, legacy = get_addresses(
+            addr=getattr(instance, 'addresses').itervalues().next()
+        )
         # Define group (or set to empty string)
-        try:
-            group = server.metadata['group']
-        except KeyError:
-            group = 'undefined'
+        group = instance.metadata.get('group', 'undefined')
 
-        # Create group if not exist and add the server
-        _server = (server.name, server.accessIPv4)
-        groups.setdefault(group, []).append('%s: %s' % _server)
+        # Create group if not exist
+        if group not in groups:
+            groups[group] = []
+
+        # Append group to list
+        ips = [instance.accessIPv4,
+               ', '.join(private),
+               ', '.join(public)]
+        if not instance.accessIPv4:
+            ips.append(', '.join(legacy))
+
+        for addr in ips:
+            if addr:
+                _instance = '%s: %s' % (instance.name, addr)
+                groups[group].append(_instance)
+            continue
+        del ips
 
     # Return server list
     print(json.dumps(groups, indent=2))
     sys.exit(0)
 
-# Get the deets for the instance asked for
-results = {}
-# This should be only one, but loop anyway
-for server in pyrax.cloudservers.list():
-    if server.accessIPv4 == args.host:
-        for key in [key for key in vars(server) if
-                    key not in ('manager', '_info')]:
-            # Extract value
-            value = getattr(server, key)
-    
-            # Generate sanitized key
-            results['rax_%s' % key] = value
+#####################################################
+# executed with a hostname as a parameter, return the
+# variables for that host
+elif len(sys.argv) == 3 and (sys.argv[1] == '--host'):
+    results = {}
+    for instance in client.servers.list():
+        private, public, legacy = get_addresses(
+            addr=getattr(instance, 'addresses').itervalues().next()
+        )
 
-print(json.dumps(results, indent=2))
-sys.exit(0)
+        # Append group to list
+        ips = [instance.accessIPv4,
+               ', '.join(private),
+               ', '.join(public)]
+        if not instance.accessIPv4:
+            ips.append(', '.join(legacy))
+
+        if sys.argv[2] in ips:
+            for key in [key for key in vars(instance) if key not in 'manager']:
+                # Extract value
+                value = getattr(instance, key)
+
+                # Generate sanitized key
+                key = 'rax_%s' % key.lower()
+
+                #TODO(UNKNOWN): maybe use value.__class__ or similar inside
+                #TODO(UNKNOWN): of key_name
+
+                # Att value to instance result (exclude manager class)
+                results[key] = value
+        del ips
+
+    print(json.dumps(results, indent=2))
+    sys.exit(0)
+else:
+    print("usage: --list  ..OR.. --host <hostname>")
+    sys.exit(1)
