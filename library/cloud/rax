@@ -19,14 +19,11 @@ DOCUMENTATION = '''
 module: rax
 short_description: create / delete an instance in Rackspace Public Cloud
 description:
-     - creates / deletes a Rackspace Public Cloud instance and optionally waits for it to be 'running'.
+     >
+     creates / deletes a Rackspace Public Cloud instance and optionally
+     waits for it to be 'running'.
 version_added: "1.2"
 options:
-  service:
-    description:
-     - Cloud service to interact with
-    choices: ['cloudservers']
-    default: cloudservers
   state:
     description:
      - Indicate desired state of the resource
@@ -82,212 +79,338 @@ options:
     description:
      - how long before wait gives up, in seconds
     default: 300
-requirements: [ "pyrax" ]
+requirements: [ "novaclient" ]
 author: Jesse Keating
 notes:
   - The following environment variables can be used, C(RAX_USERNAME),
     C(RAX_API_KEY), C(RAX_CREDS), C(RAX_CREDENTIALS), C(RAX_REGION).
-  - C(RAX_CREDENTIALS) and C(RAX_CREDS) points to a credentials file
-    appropriate for pyrax
+  - C(RAX_CREDENTIALS) and C(RAX_CREDS) points to a credentials file.
   - C(RAX_USERNAME) and C(RAX_API_KEY) obviate the use of a credentials file
   - C(RAX_REGION) defines a Rackspace Public Cloud region (DFW, ORD, LON, ...)
 '''
 
 EXAMPLES = '''
+# Creates a VM and attaches to a network and passes metadata to the instance
 - name: Build a Cloud Server
   gather_facts: False
 
   tasks:
-    - name: Server build request
+    - name: Build a RAX Cloud Server
       local_action:
         module: rax
-        credentials: ~/.raxpub
-        service: cloudservers
-        name: rax-test1
-        flavor: 5
+        state: present
+        login_username: admin
+        login_password: admin
+        name: my_ansibilifed_cloudserver
+        image_id: 4f905f38-e52a-43d2-b6ec-754a13ffb529
+        key_name: ansible_key
+        wait_for: 200
+        flavor_id: 4
         image: b11d9567-e412-4255-96b9-bd63ab23bcfe
         files:
           /root/.ssh/authorized_keys: /home/localuser/.ssh/id_rsa.pub
           /root/test.txt: /home/localuser/test.txt
-        wait: yes
-        state: present
+        nics:
+          - net-id: 34605f38-e52a-25d2-b6ec-754a13ffb723
+        meta:
+          hostname: test1
+          group: uge_master
 '''
 
+import ConfigParser
+import os
 import sys
 import time
-import os
 
 try:
-    import pyrax
+    from novaclient.v1_1 import client as nova_client
 except ImportError:
-    print("failed=True msg='pyrax required for this module'")
-    sys.exit(1)
+    print("failed=True msg='novaclient is required for this module'")
 
-# These are possible services, but only cloudservers is supported at this time
-#SUPPORTEDSERVICES = ['cloudservers', 'cloudfiles', 'cloud_blockstorage',
-#                     'cloud_databases', 'cloud_loadbalancers']
-SUPPORTEDSERVICES = ['cloudservers']
 
-def cloudservers(module, state, name, flavor, image, meta, key_name, files,
-                 wait, wait_timeout):
-    # Check our args (this could be done better)
-    for arg in (state, name, flavor, image):
-        if not arg:
-            module.fail_json(msg='%s is required for cloudservers' % arg)
+def nova_load_config_file():
+    p = ConfigParser.ConfigParser()
+    path1 = os.environ.get(
+        'RAX_CREDENTIALS', os.environ.get(
+            'RAX_CREDS_FILE', os.environ.get(
+                'ANSIBLE_CONFIG', '~/rax.ini'
+            )
+        )
+    )
+    path2 = os.getcwd() + "/rax.ini"
+    path3 = "/etc/ansible/rax.ini"
 
+    for path in path1, path2, path3:
+        if os.path.exists(path):
+            p.read(path)
+            break
+    else:
+        sys.exit('No Configuration File could be found in [%s, %s, %s]'
+                 % (path3, path2, path1))
+    return p
+
+
+class auth_plugin(object):
+    def __init__(self):
+        """Craetes an authentication plugin for use with Rackspace."""
+
+        self.auth_url = self.global_auth()
+
+    def global_auth(self):
+        """Return the Rackspace Cloud US Auth URL."""
+
+        return "https://identity.api.rackspacecloud.com/v2.0/"
+
+    def _authenticate(self, cls, auth_url):
+        """Authenticate against the Rackspace auth service."""
+
+        body = {"auth": {
+            "RAX-KSKEY:apiKeyCredentials": {
+                "username": cls.user,
+                "apiKey": cls.password,
+                "tenantName": cls.projectid}}}
+        return cls._authenticate(auth_url, body)
+
+    def authenticate(self, cls, auth_url):
+        """Authenticate against the Rackspace US auth service."""
+
+        return self._authenticate(cls, auth_url)
+
+
+def get_addresses(addr):
+    """Find Private addresses."""
+
+    snet = [x['addr'] for x in addr.get('private')]
+
+    return snet
+
+
+def build_instance_data(server):
+    """Build Instance dictionary and return it."""
+
+    snet = get_addresses(
+        addr=getattr(server, 'addresses')
+    )
+    instance = {'id': server.id,
+                'accessIPv4': server.accessIPv4,
+                'accessIPv6': server.accessIPv6,
+                'snetIPv4': snet,
+                'name': server.name,
+                'status': server.status,
+                'info': server._info}
+    return instance
+
+
+def _delete_server(module, nova):
+    try:
+        server = nova.servers.list(True, {'name': module.params['name']}).pop()
+        nova.servers.delete(server)
+    except Exception as e:
+        module.fail_json(msg="Error in deleting vm: %s" % e.message)
+
+    if module.params['wait'] == 'no':
+        module.exit_json(changed=True, result="deleted")
+
+    expire = time.time() + module.params['wait_for']
+
+    while time.time() < expire:
+        name = nova.servers.list(True, {'name': module.params['name']})
+        if not name:
+            module.exit_json(changed=True, result="deleted")
+        time.sleep(5)
+
+    module.fail_json(
+        msg=("Timed out waiting for server to get deleted, please check"
+             " manually")
+    )
+
+
+def _create_server(module, nova):
     instances = []
-    changed = False
-    servers = []
-    # See if we can find servers that match our options
-    for server in pyrax.cloudservers.list():
-        if  name != server.name:
-            continue
-        if int(flavor) != int(server.flavor['id']):
-            continue
-        if image != server.image['id']:
-            continue
-        if meta != server.metadata:
-            continue
-        # Nothing else ruled us not a match, so consider it a winner
-        servers.append(server)
+    bootargs = [module.params['name'],
+                module.params['image_id'],
+                module.params['flavor_id']]
 
-    # act on the state
-    if state in ('active', 'present'):
-        if not servers:
-            # Handle the file contents
-            for rpath in files.keys():
-                lpath = os.path.expanduser(files[rpath])
-                try:
-                    fileobj = open(lpath, 'r')
-                    files[rpath] = fileobj
-                except Exception, e:
-                    module.fail_json(msg = 'Failed to load %s' % lpath)
+    # If "files (personality)" is specified, read the files.
+    files = {}
+    if isinstance(module.params['files'], dict):
+        for f in module.params['files'].keys():
             try:
-                servers = [pyrax.cloudservers.servers.create(name=name,
-                                                             image=image,
-                                                             flavor=flavor,
-                                                             key_name=key_name,
-                                                             meta=meta,
-                                                             files=files)]
-                changed = True
-            except Exception, e:
-                module.fail_json(msg = '%s' % e.message)
+                f_local = os.path.expanduser(module.params['files'].get(f))
+                with open(f_local, 'rb') as f_open:
+                    files[f] = f_open.read()
+            except IOError as e:
+                module.fail_json(
+                    msg="File %s Not found: %s " % (f_local, e.message)
+                )
 
-        for server in servers:
-            # wait here until the instances are up
-            wait_timeout = time.time() + wait_timeout
-            while wait and wait_timeout > time.time():
-                # refresh the server details
-                server.get()
-                if server.status in ('ACTIVE', 'ERROR'):
-                    break
-                time.sleep(5)
-            if wait and wait_timeout <= time.time():
-                # waiting took too long
-                module.fail_json(msg = 'Timeout waiting on %s' % server.id)
-            # Get a fresh copy of the server details
-            server.get()
+    bootkwargs = {
+        'nics': module.params['nics'],
+        'meta': module.params['meta'],
+        'files': files,
+        'key_name': module.params['key_name'],
+        'security_groups': module.params['security_groups'].split(',')
+    }
+
+    if not module.params['key_name']:
+        del bootkwargs['key_name']
+
+    try:
+        server = nova.servers.create(*bootargs, **bootkwargs)
+        server = nova.servers.get(server.id)
+    except Exception as e:
+            module.fail_json(msg="Error in creating instance: %s " % e.message)
+
+    if module.params['wait'] == 'yes':
+        expire = time.time() + module.params['wait_for']
+
+        while time.time() < expire:
+            try:
+                server = nova.servers.get(server.id)
+            except Exception as e:
+                    module.fail_json(
+                        msg=("Error in getting info from instance: %s "
+                             % e.message)
+                    )
+
+            if server.status == 'ACTIVE':
+                instances.append(build_instance_data(server))
+                module.exit_json(instances=instances, changed=True)
+
             if server.status == 'ERROR':
-                module.fail_json(msg = '%s failed to build' % server.id)
-            instance = {'id': server.id,
-                        'accessIPv4': server.accessIPv4,
-                        'name': server.name,
-                        'status': server.status}
-            instances.append(instance)
+                module.fail_json(
+                    msg="Error in creating the server, please check logs"
+                )
+            time.sleep(2)
 
-    elif state in ('absent', 'deleted'):
-        deleted = []
-        # See if we can find a server that matches our credentials
-        for server in servers:
-            if server.name == name:
-                if int(server.flavor['id']) == int(flavor) and \
-                server.image['id'] == image and \
-                server.metadata == meta:
-                    try:
-                        server.delete()
-                        deleted.append(server)
-                    except Exception, e:
-                        module.fail_json(msg = e.message)
-                    instance = {'id': server.id,
-                                'accessIPv4': server.accessIPv4,
-                                'name': server.name,
-                                'status': 'DELETING'}
-                    instances.append(instance)
-                    changed = True
+        module.fail_json(
+            msg=("Timeout waiting for the server to come up.."
+                 " Please check manually")
+        )
 
-    module.exit_json(changed=changed, instances=instances)
+    if server.status == 'ERROR':
+        module.fail_json(
+            msg="Error in creating the server.. Please check manually"
+        )
+
+    instances.append(build_instance_data(server))
+    module.exit_json(instances=instances, changed=True)
+
+
+def _get_server_state(module, nova):
+    instances = []
+    server = None
+    try:
+        servers = nova.servers.list(True, {'name': module.params['name']})
+        if servers:
+            server = servers.pop()
+    except Exception as e:
+        module.fail_json(
+            msg="Error in getting the server list: %s" % e.message
+        )
+
+    if server and module.params['state'] == 'present':
+
+        if server.status != 'ACTIVE':
+            module.fail_json(
+                msg=("The VM is available but not Active. state: %s"
+                     % server.status)
+            )
+
+        instances.append(build_instance_data(server))
+        module.exit_json(instances=instances, changed=True)
+
+    if server and module.params['state'] == 'absent':
+        return True
+
+    if module.params['state'] == 'absent':
+        module.exit_json(changed=False, result="not present")
+
+    return True
+
 
 def main():
+    # Default RAX Networks, Public and Private.
+    default_nics = [{'net-id': '00000000-0000-0000-0000-000000000000'},
+                    {'net-id': '11111111-1111-1111-1111-111111111111'}]
+
+    # This block makes the system compatible with environment vars
+    # Setup the credentials and region
+    username = None
+    password = None
+    region = None
+    try:
+        # Parse Configuration File
+        config = nova_load_config_file()
+        username = config.get('rackspace_cloud', 'username')
+        password = config.get('rackspace_cloud', 'api_key')
+        # Region may not be in an existing cred file. this is for compatibility
+        try:
+            region = config.get('rackspace_cloud', 'region')
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        plugin = auth_plugin()
+        if region is None:
+            region = os.environ.get('RAX_REGION')
+        if password is None:
+            password = os.environ.get('RAX_API_KEY')
+        if username is None:
+            username = os.environ.get('RAX_USERNAME')
+
     module = AnsibleModule(
-        argument_spec = dict(
-            service = dict(default='cloudservers', choices=SUPPORTEDSERVICES),
-            state = dict(default='present', choices=['active', 'present',
-                                                     'deleted', 'absent']),
-            credentials = dict(aliases = ['creds_file']),
-            api_key=dict(),
-            username=dict(),
-            name = dict(),
-            flavor = dict(),
-            image = dict(),
-            meta = dict(type='dict', default={}),
-            key_name = dict(aliases = ['keypair']),
-            files = dict(type='dict', default={}),
-            region = dict(),
-            wait = dict(type='bool', choices=BOOLEANS),
-            wait_timeout = dict(default=300),
+        argument_spec=dict(
+            login_username=dict(default=username),
+            login_api_key=dict(default=password),
+            auth_url=dict(default=plugin.auth_url),
+            region_name=dict(default=region),
+            name=dict(required=True),
+            image_id=dict(default=None),
+            flavor_id=dict(default=1),
+            key_name=dict(default=None),
+            security_groups=dict(default='default'),
+            nics=dict(default=default_nics),
+            meta=dict(default=None),
+            wait=dict(default='yes', choices=['yes', 'no']),
+            wait_for=dict(default=300),
+            state=dict(default='present',
+                       choices=['active', 'present', 'deleted', 'absent']),
+            files=dict(type='dict', default={}),
         )
     )
 
-    service = module.params.get('service')
-    state = module.params.get('state')
-    credentials = module.params.get('credentials')
-    api_key = module.params.get('api_key')
-    username = module.params.get('username')
-    name = module.params.get('name')
-    flavor = module.params.get('flavor')
-    image = module.params.get('image')
-    meta = module.params.get('meta')
-    key_name = module.params.get('key_name')
-    files = module.params.get('files')
-    region = module.params.get('region')
-    wait = module.params.get('wait')
-    wait_timeout = int(module.params.get('wait_timeout'))
-
-    # Setup the credentials and region
     try:
-        username = username or os.environ.get('RAX_USERNAME')
-        api_key = api_key or os.environ.get('RAX_API_KEY')
-        credentials = credentials or os.environ.get('RAX_CREDENTIALS') or \
-                                     os.environ.get('RAX_CREDS_FILE')
-        region = region or os.environ.get('RAX_REGION')
+        nova = nova_client.Client(
+            username=username,
+            api_key=password,
+            auth_url=plugin.auth_url,
+            region_name=region,
+            project_id=username,
+            auth_system='rackspace',
+            auth_plugin=plugin,
+            service_type='compute'
+        )
+    except Exception as e:
+        module.fail_json(
+            msg="Error in authenticating to nova: %s" % e.message
+        )
 
-    except KeyError, e:
-        module.fail_json(msg = 'Unable to load %s' % e.message)
-
-    # setup the auth
-    try:
-        pyrax.set_setting("identity_type", "rackspace")
-        if api_key and username:
-            pyrax.set_credentials(username, api_key=api_key, region=region)
-        elif credentials:
-            credentials = os.path.expanduser(credentials)
-            pyrax.set_credential_file(credentials, region=region)
+    if module.params['state'] == 'present':
+        if not module.params['image_id']:
+            module.fail_json(
+                msg="Parameter 'image_id' is required if state == 'present'"
+            )
         else:
-            raise Exception('No credentials supplied!')
-    except Exception, e:
-        module.fail_json(msg = '%s' % e.message)
+            _get_server_state(module, nova)
+            _create_server(module, nova)
 
-    # Act based on service
-    if service == 'cloudservers':
-        cloudservers(module, state, name, flavor, image, meta, key_name, files,
-                     wait, wait_timeout)
-    elif service in ['cloudfiles', 'cloud_blockstorage',
-                     'cloud_databases', 'cloud_loadbalancers']:
-        module.fail_json(msg = 'Service %s is not supported at this time' %
-                         service)
+    if module.params['state'] == 'absent':
+        _get_server_state(module, nova)
+        _delete_server(module, nova)
 
 
 # this is magic, see lib/ansible/module_common.py
 #<<INCLUDE_ANSIBLE_MODULE_COMMON>>
-
 main()
