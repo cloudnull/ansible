@@ -33,6 +33,7 @@ import ansible.constants as C
 from ansible.callbacks import vvv
 from ansible import errors
 from ansible import utils
+from ansible.runner import connection_plugins
 
 
 class Connection(object):
@@ -144,6 +145,7 @@ class Connection(object):
             os.write(self.wfd, "%s\n" % self.password)
             os.close(self.wfd)
 
+    @connection_plugins.retry(errors.AnsibleError, tries=3, delay=2)
     def _communicate(self, p, stdin, indata, sudoable=False, prompt=None):
         fcntl.fcntl(p.stdout, fcntl.F_SETFL, fcntl.fcntl(p.stdout, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         fcntl.fcntl(p.stderr, fcntl.F_SETFL, fcntl.fcntl(p.stderr, fcntl.F_GETFL) & ~os.O_NONBLOCK)
@@ -209,12 +211,12 @@ class Connection(object):
         else:
             user_host_file = "~/.ssh/known_hosts"
         user_host_file = os.path.expanduser(user_host_file)
-        
+
         host_file_list = []
         host_file_list.append(user_host_file)
         host_file_list.append("/etc/ssh/ssh_known_hosts")
         host_file_list.append("/etc/ssh/ssh_known_hosts2")
-        
+
         hfiles_not_found = 0
         for hf in host_file_list:
             if not os.path.exists(hf):
@@ -228,7 +230,7 @@ class Connection(object):
             else:
                 data = host_fh.read()
                 host_fh.close()
-                
+
             for line in data.split("\n"):
                 line = line.strip()
                 if line is None or " " not in line:
@@ -256,6 +258,7 @@ class Connection(object):
             vvv("EXEC previous known host file not found for %s" % host)
         return True
 
+    @connection_plugins.retry(errors.AnsibleError, tries=3, delay=1)
     def exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable='/bin/sh', in_data=None):
         ''' run a command on the remote host '''
 
@@ -362,7 +365,7 @@ class Connection(object):
         (returncode, stdout, stderr) = self._communicate(p, stdin, in_data, sudoable=sudoable, prompt=prompt)
 
         if C.HOST_KEY_CHECKING and not_in_host_file:
-            # lock around the initial SSH connectivity so the user prompt about whether to add 
+            # lock around the initial SSH connectivity so the user prompt about whether to add
             # the host to known hosts is not intermingled with multiprocess output.
             fcntl.lockf(self.runner.output_lockfile, fcntl.LOCK_UN)
             fcntl.lockf(self.runner.process_lockfile, fcntl.LOCK_UN)
@@ -375,9 +378,9 @@ class Connection(object):
 
         if p.returncode != 0 and controlpersisterror:
             raise errors.AnsibleError('using -c ssh on certain older ssh versions may not support ControlPersist, set ANSIBLE_SSH_ARGS="" (or ssh_args in [ssh_connection] section of the config file) before running again')
-        if p.returncode == 255 and (in_data or self.runner.module_name == 'raw'):
+        elif p.returncode == 255 and (in_data or self.runner.module_name == 'raw'):
             raise errors.AnsibleError('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
-        if p.returncode == 255:
+        elif p.returncode == 255:
             ip = None
             port = None
             for line in stderr.splitlines():
